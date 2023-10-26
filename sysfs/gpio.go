@@ -5,6 +5,7 @@
 package sysfs
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,11 @@ type Pin struct {
 	fValue     fileIO    // handle to /sys/class/gpio/gpio*/value; never closed
 	event      fs.Event  // Initialized once
 	buf        [4]byte   // scratch buffer for Func(), Read() and Out()
+
+	pwmChipPath string // pwm chip path
+	pwmPath     string // pwm path
+	pwmNum      int    // pwm number (0 or 1)
+	pwmEnabled  bool   // pwm enabled status
 }
 
 // String implements conn.Resource.
@@ -61,6 +67,12 @@ func (p *Pin) String() string {
 func (p *Pin) Halt() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	err := p.haltPWM()
+	if err != nil {
+		return err
+	}
+
 	return p.haltEdge()
 }
 
@@ -303,8 +315,101 @@ func (p *Pin) Out(l gpio.Level) error {
 // PWM implements gpio.PinOut.
 //
 // This is not supported on sysfs.
-func (p *Pin) PWM(gpio.Duty, physic.Frequency) error {
-	return p.wrap(errors.New("pwm is not supported via sysfs"))
+func (p *Pin) PWM(duty gpio.Duty, frequency physic.Frequency) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.pwmNum < 0 {
+		return p.wrap(errors.New("pwm is not supported on this pin"))
+	}
+
+	fPeriod, err := fileIOOpen(p.pwmPath+"/period", os.O_WRONLY)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// export if needed
+			fExport, err := fileIOOpen(p.pwmChipPath+"/export", os.O_WRONLY)
+			if err != nil {
+				return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
+			}
+			defer fExport.Close()
+
+			_, err = fExport.Write([]byte(strconv.Itoa(p.pwmNum)))
+			if err != nil {
+				return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
+			}
+
+			fPeriod, err = fileIOOpen(p.pwmPath+"/period", os.O_WRONLY)
+			if err != nil {
+				return p.wrap(err)
+			}
+		} else {
+			return p.wrap(err)
+		}
+	}
+	defer fPeriod.Close()
+
+	if frequency == 0 {
+		err = p.writePWMEnable(false)
+		return p.wrap(err)
+	}
+
+	fDuty, err := fileIOOpen(p.pwmPath+"/duty_cycle", os.O_WRONLY)
+	if err != nil {
+		return p.wrap(err)
+	}
+	defer fDuty.Close()
+
+	// convert frequency to period in nanoseconds
+	periodNanos := frequency.Period().Nanoseconds()
+	_, err = fPeriod.Write([]byte(strconv.FormatInt(periodNanos, 10)))
+	if err != nil {
+		return p.wrap(err)
+	}
+
+	dutyNanos := periodNanos * int64(duty) / int64(gpio.DutyMax)
+	_, err = fDuty.Write([]byte(strconv.FormatInt(dutyNanos, 10)))
+	if err != nil {
+		return p.wrap(err)
+	}
+
+	err = p.writePWMEnable(true)
+	if err != nil {
+		return p.wrap(err)
+	}
+
+	return nil
+}
+
+func (p *Pin) haltPWM() error {
+	if p.pwmEnabled {
+		return p.writePWMEnable(false)
+	}
+	return nil
+}
+
+func (p *Pin) writePWMEnable(value bool) error {
+	if value == p.pwmEnabled {
+		return nil
+	}
+
+	fEnable, err := fileIOOpen(p.pwmPath+"/enable", os.O_WRONLY)
+	if err != nil {
+		return p.wrap(err)
+	}
+	defer fEnable.Close()
+
+	valueStr := "0"
+	if value {
+		valueStr = "1"
+	}
+
+	_, err = fEnable.Write([]byte(valueStr))
+	if err != nil {
+		return p.wrap(err)
+	}
+
+	p.pwmEnabled = value
+	return nil
 }
 
 //
@@ -421,6 +526,32 @@ func readInt(path string) (int, error) {
 	return strconv.Atoi(string(raw[:len(raw)-1]))
 }
 
+// readBinaryUInt32Array reads a pseudo-file (sysfs) that is known to contain an
+// array of integers in binary
+func readBinaryUInt32Array(path string) ([]uint32, error) {
+	f, err := fileIOOpen(path, os.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var arr []uint32
+
+	for {
+		var value uint32
+		err = binary.Read(f, binary.BigEndian, &value)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		arr = append(arr, value)
+	}
+
+	return arr, nil
+}
+
 // driverGPIO implements periph.Driver.
 type driverGPIO struct {
 	exportHandle io.Writer // handle to /sys/class/gpio/export
@@ -481,6 +612,13 @@ func (d *driverGPIO) parseGPIOChip(path string) error {
 	if err != nil {
 		return err
 	}
+
+	// check for pwm pins in <path>/device/of_node/pwm_pins/brcm,pins
+	pwmPins, err := readBinaryUInt32Array(path + "/device/of_node/pwm_pins/brcm,pins")
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
 	// TODO(maruel): The chip driver may lie and lists GPIO pins that cannot be
 	// exported. The only way to know about it is to export it before opening.
 	for i := base; i < base+number; i++ {
@@ -500,6 +638,17 @@ func (d *driverGPIO) parseGPIOChip(path string) error {
 		// driver has to unregister this pin and map its own after.
 		if err := gpioreg.RegisterAlias(strconv.Itoa(i), p.name); err != nil {
 			return err
+		}
+
+		p.pwmNum = -1
+		for pwmNum, pwmPin := range pwmPins {
+			if i == int(pwmPin) {
+				p.pwmNum = pwmNum
+				p.pwmChipPath = "/sys/class/pwm/pwmchip0" //TODO support multiple pwm chips
+				p.pwmPath = fmt.Sprintf("%s/pwm%d", p.pwmChipPath, pwmNum)
+				gpioreg.RegisterAlias(fmt.Sprintf("PWM%d_OUT", pwmNum), p.name)
+				break
+			}
 		}
 	}
 	return nil
