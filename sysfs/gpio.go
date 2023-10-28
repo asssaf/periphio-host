@@ -323,35 +323,38 @@ func (p *Pin) PWM(duty gpio.Duty, frequency physic.Frequency) error {
 		return p.wrap(errors.New("pwm is not supported on this pin"))
 	}
 
-	fPeriod, err := fileIOOpen(p.pwmPath+"/period", os.O_WRONLY)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// export if needed
-			fExport, err := fileIOOpen(p.pwmChipPath+"/export", os.O_WRONLY)
-			if err != nil {
-				return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
-			}
-			defer fExport.Close()
+	if _, err := os.Stat(p.pwmPath + "/enable"); os.IsNotExist(err) {
+		// export if needed
+		fExport, err := fileIOOpen(p.pwmChipPath+"/export", os.O_WRONLY)
+		if err != nil {
+			return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
+		}
+		defer fExport.Close()
 
-			_, err = fExport.Write([]byte(strconv.Itoa(p.pwmNum)))
-			if err != nil {
-				return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
-			}
+		_, err = fExport.Write([]byte(strconv.Itoa(p.pwmNum)))
+		if err != nil {
+			return p.wrap(fmt.Errorf("failed to export pwm: %v", err))
+		}
+		fExport.Close()
+	}
 
-			fPeriod, err = fileIOOpen(p.pwmPath+"/period", os.O_WRONLY)
-			if err != nil {
-				return p.wrap(err)
-			}
-		} else {
+	if frequency == 0 || duty == 0 || duty == gpio.DutyMax {
+		if err := p.writePWMEnable(false); err != nil {
 			return p.wrap(err)
 		}
+		return nil
 	}
-	defer fPeriod.Close()
 
-	if frequency == 0 {
-		err = p.writePWMEnable(false)
+	// disable pwm while changing
+	if err := p.writePWMEnable(false); err != nil {
 		return p.wrap(err)
 	}
+
+	fPeriod, err := fileIOOpen(p.pwmPath+"/period", os.O_WRONLY)
+	if err != nil {
+		return p.wrap(err)
+	}
+	defer fPeriod.Close()
 
 	fDuty, err := fileIOOpen(p.pwmPath+"/duty_cycle", os.O_WRONLY)
 	if err != nil {
@@ -365,12 +368,14 @@ func (p *Pin) PWM(duty gpio.Duty, frequency physic.Frequency) error {
 	if err != nil {
 		return p.wrap(err)
 	}
+	fPeriod.Close()
 
 	dutyNanos := periodNanos * int64(duty) / int64(gpio.DutyMax)
 	_, err = fDuty.Write([]byte(strconv.FormatInt(dutyNanos, 10)))
 	if err != nil {
 		return p.wrap(err)
 	}
+	fDuty.Close()
 
 	err = p.writePWMEnable(true)
 	if err != nil {

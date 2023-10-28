@@ -200,6 +200,7 @@ type Pin struct {
 	// Mutable.
 	usingEdge  bool           // Set when edge detection is enabled.
 	usingClock bool           // Set when a CLK, PWM or I2S/PCM clock is used.
+	usingSysfs bool           // Set when PWM is being used through sysfs
 	dmaCh      *dmaChannel    // Set when DMA is used for PWM or I2S/PCM.
 	dmaBuf     *videocore.Mem // Set when DMA is used for PWM or I2S/PCM.
 }
@@ -216,11 +217,12 @@ func (p *Pin) String() string {
 // In the case of clock or PWM, all pins with this clock source are also
 // disabled.
 func (p *Pin) Halt() error {
-	if p.usingEdge {
+	if p.usingEdge || p.usingSysfs {
 		if err := p.sysfsPin.Halt(); err != nil {
 			return p.wrap(err)
 		}
 		p.usingEdge = false
+		p.usingSysfs = false
 	}
 	return p.haltClock()
 }
@@ -379,6 +381,13 @@ func (p *Pin) SetFunc(f pin.Func) error {
 // and looks for '011' to rising and '100' for falling detection to avoid
 // glitches. Because gpio sysfs is used, the latency is unpredictable.
 func (p *Pin) In(pull gpio.Pull, edge gpio.Edge) error {
+	// disable sysfs pwm if enabled
+	if p.usingSysfs {
+		if err := p.sysfsPin.Halt(); err != nil {
+			return err
+		}
+		p.usingSysfs = false
+	}
 	if p.usingEdge && edge == gpio.NoEdge {
 		if err := p.sysfsPin.Halt(); err != nil {
 			return p.wrap(err)
@@ -544,6 +553,14 @@ func (p *Pin) DefaultPull() gpio.Pull {
 //
 // Fails if requesting to change a pin that is set to special functionality.
 func (p *Pin) Out(l gpio.Level) error {
+	// disable sysfs pwm if enabled
+	if p.usingSysfs {
+		if err := p.sysfsPin.Halt(); err != nil {
+			return err
+		}
+		p.usingSysfs = false
+	}
+
 	if drvGPIO.gpioMemory == nil {
 		if p.sysfsPin == nil {
 			return p.wrap(errors.New("subsystem gpiomem not initialized and sysfs not accessible"))
@@ -636,6 +653,14 @@ func (p *Pin) PWM(duty gpio.Duty, freq physic.Frequency) error {
 		return p.wrap(errors.New("subsystem gpiomem not initialized"))
 	}
 	if drvDMA.pwmMemory == nil || drvDMA.clockMemory == nil {
+		// try falling back to sysfs
+		if p.sysfsPin != nil {
+			if err := p.sysfsPin.PWM(duty, freq); err != nil {
+				return p.wrap(err)
+			}
+			p.usingSysfs = true
+			return nil
+		}
 		return p.wrap(errors.New("bcm283x-dma not initialized; try again as root?"))
 	}
 	if useDMA {
